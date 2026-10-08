@@ -31,6 +31,8 @@ silence. **This is not one of those.**
 In short: a loud, perfectly timed wrong note and a quiet, perfectly intended ornament look the
 same to a generic cleaner. Against the score they are easy to tell apart.
 
+### Interested in the project and want to help with further development? Join the Discord: https://discord.gg/HDRX89mQ9
+
 ## What it changes
 
 Exactly two kinds of edit, each of which can be switched off:
