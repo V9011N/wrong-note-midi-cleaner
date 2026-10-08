@@ -48,6 +48,8 @@ class Comparison:
     pitch_lo: int
     pitch_hi: int
     n_human: int  # notes in the human file; the rest of the human roll are the proposed additions
+    # per human-roll note: the note it re-strikes, whose hold it would hand over when removed; else -1
+    merged_into: np.ndarray
 
 
 def note_name(pitch: int) -> str:
@@ -113,6 +115,10 @@ def build_comparison(perfect: MidiData, human: MidiData, alignment: Alignment,
     h_status = np.concatenate([h_status, np.full(len(source), ADD, h_status.dtype)])
     h_partner = np.concatenate([h_partner, source])
 
+    merged_into = np.full(len(h_pitches), -1, dtype=int)
+    for restruck, (keeper, _release) in plan.extend.items():
+        merged_into[restruck] = keeper
+
     pitch_lo = int(min(perfect.pitches.min(), h_pitches.min()))
     pitch_hi = int(max(perfect.pitches.max(), h_pitches.max()))
     return Comparison(
@@ -123,6 +129,7 @@ def build_comparison(perfect: MidiData, human: MidiData, alignment: Alignment,
         pitch_lo=pitch_lo,
         pitch_hi=max(pitch_hi, pitch_lo + 11),  # never less than an octave tall
         n_human=n_real,
+        merged_into=merged_into,
     )
 
 
@@ -156,6 +163,10 @@ def describe_note(comp: Comparison, side: str, index: int) -> str:
     who, other_who = ("Human", "perfect") if side == "h" else ("Perfect", "human")
     meaning = (HUMAN_MEANING if side == "h" else PERFECT_MEANING)[int(own.status[index])]
     text = f"{who} {note_name(int(own.pitches[index]))} at {own.file_time[index]:.2f} s: {meaning}."
+    keeper = int(comp.merged_into[index]) if side == "h" else -1
+    if keeper >= 0:
+        text += (f" It re-strikes the note at {comp.human.file_time[keeper]:.2f} s while that key is held, "
+                 "so that note takes over its release and keeps the full hold.")
     partner = int(own.partner[index])
     if partner >= 0 and int(own.status[index]) not in (ADD, ADDED):  # a made-up note has no real timing
         h, p = (index, partner) if side == "h" else (partner, index)

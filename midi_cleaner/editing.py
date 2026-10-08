@@ -64,7 +64,12 @@ class EditSession:
         human[removed] = REMOVED
         human[self.base.n_human + np.array(added, dtype=int)] = ADDED
         perfect[self._source[np.array(added, dtype=int)]] = ADDED
-        return replace(self.base, human=replace(self.base.human, status=human),
+        end = self.base.human.end.copy()
+        for h in removed:  # a removed re-strike hands its release to the note it doubles
+            keeper, release = self.plan.extend.get(h, (-1, 0.0))
+            if keeper >= 0:
+                end[keeper] = max(end[keeper], release - self.human.start)
+        return replace(self.base, human=replace(self.base.human, status=human, end=end),
                        perfect=replace(self.base.perfect, status=perfect))
 
     # ---- editing ----------------------------------------------------------------
@@ -122,7 +127,8 @@ class EditSession:
         """A plan holding only the edits applied so far."""
         state = self.state
         return CleaningPlan(remove=np.array(sorted(state.removed), dtype=int),
-                            add=[self.plan.add[k] for k in sorted(state.added)])
+                            add=[self.plan.add[k] for k in sorted(state.added)],
+                            extend={h: v for h, v in self.plan.extend.items() if h in state.removed})
 
     def build_midi(self) -> mido.MidiFile:
         """The human file with the applied edits; every other event is kept exactly as recorded."""

@@ -35,7 +35,9 @@ same to a generic cleaner. Against the score they are easy to tell apart.
 
 Exactly two kinds of edit, each of which can be switched off:
 
-- **Remove notes**: performed notes that have no counterpart in the perfect source.
+- **Remove notes**: performed notes that have no counterpart in the perfect source. A note that
+  re-strikes a key the score is still holding (a held note played twice) is removed too, but
+  the note it duplicates takes over its release, so the hold isn't cut short.
 - **Add notes**: written notes the performance lacks. An added note takes its onset from the
   chord it belongs to or from the performer's own neighbouring notes, its velocity from nearby
   notes the performer played, and its length from the source scaled to the local tempo.
@@ -63,6 +65,12 @@ Not done yet (deliberately deferred): evening out notes inside scales and other 
    pitch that are close in time are one note played a little off, not a wrong note, so they are
    left alone. Nothing is edited near the joins between aligned stretches or where the local
    alignment is poorly supported.
+5. **Double-played held notes.** When the performer strikes a key twice for one note the score
+   holds, the strike closest to the score's timing is the one that matches, and the other is
+   "extra". Deleting the extra one alone would leave a short bounce where a held note belongs,
+   so the kept note inherits the extra strike's release instead (never running into the next
+   strike of the same key, and only when the score still has the key down or the first strike
+   is still sounding). A late same-pitch note after the score released the key is just removed.
 
 ## Using it
 
