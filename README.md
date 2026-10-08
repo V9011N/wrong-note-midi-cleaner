@@ -75,11 +75,14 @@ python app.py
    automatically.
 2. The **Add notes** / **Remove notes** boxes are ticked from what was found. You may change
    them, but at least one must stay selected.
-3. Click **Clean**. When cleaning is done a save dialog opens so you can choose where the
-   result goes.
+3. Click **Full Clean** to apply the ticked fixes to the whole performance. When cleaning is
+   done a save dialog opens so you can choose where the result goes.
 
-Optionally, click **Show comparison...** (enabled once the files have been compared) to see
-how the two files' notes pair up. It is a separate window and never opens by itself:
+Or click **Open Editor...** (enabled once the files have been compared) to see how the two files'
+notes pair up and clean only the parts you choose. The editor is a separate window and never
+opens by itself.
+
+### The editor
 
 - The **perfect source's piano roll is on top and the human performance's below**, sharing one
   time axis. The perfect source is laid onto the performance's timing using the alignment, so
@@ -94,10 +97,30 @@ how the two files' notes pair up. It is a separate window and never opens by its
   are hidden until ticked. Hiding a note also hides its line.
 - **Click** any note, in either roll, to draw a line to its counterpart (for a missing source
   note, the blue note that would fill it); the status bar explains what the note is. **Drag a
-  box** to select a group and draw every line at once (hold Shift to add to a selection).
+  box** to select a group and draw every line at once (hold Shift to add to a selection, Ctrl+A
+  selects everything the filters show).
 - **Zoom and pan** apply to both rolls together so pitches stay lined up. Scroll pans in time,
   Shift+scroll in pitch; Ctrl+scroll zooms in time, Ctrl+Shift+scroll in pitch (the buttons and
   scrollbars do the same); right-drag pans both ways; Esc clears the selection.
+
+**Cleaning by hand.** Nothing changes until you select notes and click **Clean Selection**
+(the button appears with a selection and says what it will do, e.g. "remove 3 + add 1"). It
+applies the cleaner's proposals to the selected notes only: wrong (red) notes are deleted, and a
+missing note is inserted when you select either the source note or its blue proposal. Correct
+notes are never touched, and everything you leave out of the selection is left alone. Filters
+decide what a selection can reach: hide the wrong notes and a box selection only adds.
+Deleted notes stay on the roll as pale dashed outlines and inserted ones turn green with a blue
+edge, so the result is visible.
+
+- **Undo / Redo** (buttons, **Ctrl+Z**, **Ctrl+Y** or Ctrl+Shift+Z) step through the cleaning
+  steps. A new edit after an undo discards what could have been redone.
+- **Save Project** (Ctrl+S) writes a small `.wnproject` file: the two file paths, a hash of each
+  and which edits are applied. It holds no MIDI. **Open Project...** in the main window analyses
+  the files again and reopens the editor with those edits applied; it warns if either file has
+  changed since the project was saved. Closing the editor or the app asks to save unsaved edits.
+- **Export cleaned MIDI** (Ctrl+E) writes the human file with only the applied edits, through
+  the same writer as Full Clean, so everything else in it is untouched. Selecting everything and
+  cleaning gives byte-for-byte the Full Clean result. The original files are never overwritten.
 
 ## Measured so far
 
@@ -124,8 +147,11 @@ wrong notes or more) on dense pieces fall into the "uncertain" band.
 ```
 app.py                  tkinter UI
 midi_cleaner/
-  comparison.py         lays both files on one timeline for the comparison view (no GUI code)
-  compare_view.py       the comparison window: stacked piano rolls and match lines
+  comparison.py         lays both files on one timeline for the editor (no GUI code)
+  editing.py            the editor's state: applied edits, undo/redo, the cleaned MIDI (no GUI code)
+  project.py            save / reopen an editing session as a .wnproject file (no GUI code)
+  editor.py             the editor window: stacked piano rolls, match lines, Clean Selection
+  dialogs.py            file dialogs shared by the main window and the editor
   loader.py             MIDI -> note table (mido); remembers where every note came from
   alignment.py          coarse + fine time alignment (jump-aware DTW)
   confidence.py         match confidence and verdict

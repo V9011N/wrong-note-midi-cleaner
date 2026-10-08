@@ -15,6 +15,9 @@ from .alignment import Alignment
 from .cleaning import ADD, DISPLACED, HELD, MATCHED, OUTSIDE, REMOVE, UNTRUSTED, CleaningPlan
 from .loader import MidiData
 
+# Statuses an edit gives a note, on top of the cleaner's own (cleaning.MATCHED, REMOVE, ...).
+REMOVED, ADDED = 7, 8  # a wrong note that was deleted / a missing note that was inserted
+
 SCALE_RANGE = (0.4, 2.5)  # a note's length on the shared timeline vs. in its own file
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 
@@ -32,7 +35,7 @@ class Roll:
     start: np.ndarray  # seconds on the shared timeline
     end: np.ndarray
     file_time: np.ndarray  # seconds into its own file (from its first note)
-    status: np.ndarray  # cleaning outcome of each note (cleaning.MATCHED, REMOVE, ...)
+    status: np.ndarray  # cleaning outcome of each note (cleaning.MATCHED, REMOVE, ... or REMOVED, ADDED)
     partner: np.ndarray  # index of the matching note in the other roll, -1 if none
 
 
@@ -44,6 +47,7 @@ class Comparison:
     t_max: float
     pitch_lo: int
     pitch_hi: int
+    n_human: int  # notes in the human file; the rest of the human roll are the proposed additions
 
 
 def note_name(pitch: int) -> str:
@@ -118,6 +122,7 @@ def build_comparison(perfect: MidiData, human: MidiData, alignment: Alignment,
         t_max=float(max(p_off.max(), h_off.max())),
         pitch_lo=pitch_lo,
         pitch_hi=max(pitch_hi, pitch_lo + 11),  # never less than an octave tall
+        n_human=n_real,
     )
 
 
@@ -126,6 +131,8 @@ def build_comparison(perfect: MidiData, human: MidiData, alignment: Alignment,
 HUMAN_MEANING = {
     ADD: "to be added: the score has this note and the performance lacks it "
          "(Add notes would insert it here, this is only a proposal)",
+    ADDED: "added: the score has this note and it has now been inserted",
+    REMOVED: "removed: it was not in the perfect source and has been deleted",
     MATCHED: "correct, it is in the perfect source",
     DISPLACED: "the right note, but its timing is well off the score",
     REMOVE: "wrong, it is not in the perfect source (Remove notes would delete it)",
@@ -133,6 +140,7 @@ HUMAN_MEANING = {
     OUTSIDE: "outside the part of the piece that could be aligned, so it was not judged",
 }
 PERFECT_MEANING = {
+    ADDED: "was missing from the performance and has now been inserted (the blue note)",
     MATCHED: "the human played it",
     DISPLACED: "the human played it, but well off the score's timing",
     ADD: "missing from the performance (Add notes would insert it where the blue note is)",
@@ -149,7 +157,7 @@ def describe_note(comp: Comparison, side: str, index: int) -> str:
     meaning = (HUMAN_MEANING if side == "h" else PERFECT_MEANING)[int(own.status[index])]
     text = f"{who} {note_name(int(own.pitches[index]))} at {own.file_time[index]:.2f} s: {meaning}."
     partner = int(own.partner[index])
-    if partner >= 0 and int(own.status[index]) != ADD:
+    if partner >= 0 and int(own.status[index]) not in (ADD, ADDED):  # a made-up note has no real timing
         h, p = (index, partner) if side == "h" else (partner, index)
         lag = comp.human.start[h] - comp.perfect.start[p]
         text += (f" Paired with the {other_who} note at {other.file_time[partner]:.2f} s; "

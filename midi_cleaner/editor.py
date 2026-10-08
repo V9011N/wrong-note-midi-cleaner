@@ -1,26 +1,36 @@
-"""The comparison window: the perfect source's piano roll above the human performance's.
+"""The editor: the perfect source's piano roll above the human performance's, to clean by hand.
 
 Human notes are green when they match the score, red when the score doesn't have them, blue
 when they are notes the cleaner would add, and grey when it could not tell. Click a note, or
 drag a box around several, to draw a line to each note's counterpart in the other roll. Each
 roll has its own filters, and both rolls share one zoom and scroll position.
+
+Nothing is changed until "Clean Selection": it applies the cleaner's proposals (delete the wrong
+notes, insert the missing ones) to the selected notes only, and leaves everything else alone.
+Every such step can be undone and redone. The edits can be kept as a project, or written out as a
+cleaned MIDI; the original files are never modified.
 """
 
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk
+from pathlib import Path
+from tkinter import messagebox, ttk
 
 import numpy as np
 
+from . import dialogs
 from .cleaning import ADD, DISPLACED, MATCHED, REMOVE
-from .comparison import Comparison, Roll, describe_note, note_name
+from .comparison import ADDED, REMOVED, Comparison, Roll, describe_note, note_name
+from .editing import EditSession
+from .project import save_project
 
 PERFECT_COLOR = "#555b66"  # neutral, so that blue stays "to be added"
 CORRECT_COLOR = "#2e9e4f"
 WRONG_COLOR = "#d62f2f"
 ADDED_COLOR = "#1f6fe0"
 UNJUDGED_COLOR = "#a8a8a8"
+REMOVED_FILL = "#f3c9c9"  # a deleted note stays on the roll as a pale, dashed ghost
 LINK_COLOR = "#111111"
 PANEL_BG, BLACK_KEY_BG = "#fbfbfc", "#eef0f4"
 GRID_COLOR, OCTAVE_COLOR = "#dfe2e8", "#b4bac6"
@@ -38,27 +48,34 @@ DRAG_THRESHOLD = 4
 HIT_RADIUS = 2
 TICK_STEPS = (0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800)
 SHIFT, CONTROL = 0x1, 0x4
-HINT = ("Click a note to see its match, or drag a box to select a group. Scroll pans in time, "
-        "Shift+scroll in pitch; Ctrl+scroll zooms in time, Ctrl+Shift+scroll in pitch; "
+HINT = ("Click a note to see its match, or drag a box (Ctrl+A for everything shown) to select a group, "
+        "then Clean Selection. Ctrl+Z undo, Ctrl+Y redo, Ctrl+S save project, Ctrl+E export. "
+        "Scroll pans in time, Shift+scroll in pitch; Ctrl+scroll zooms in time, Ctrl+Shift+scroll in pitch; "
         "right-drag pans; Esc clears.")
-JUDGED = (MATCHED, DISPLACED, REMOVE, ADD)  # human statuses with their own filter
+CORRECT = (MATCHED, DISPLACED, ADDED)  # human statuses the "correct notes" filter covers
+WRONG = (REMOVE, REMOVED)  # ... the "wrong notes" filter
+JUDGED = (MATCHED, DISPLACED, ADDED, REMOVE, REMOVED, ADD)  # everything else is "not judged"
+# status -> (fill, outline, dash)
+HUMAN_STYLE = {
+    MATCHED: (CORRECT_COLOR, "", None), DISPLACED: (CORRECT_COLOR, "", None),
+    ADDED: (CORRECT_COLOR, ADDED_COLOR, None),  # a note that was just inserted keeps a blue edge
+    REMOVE: (WRONG_COLOR, "", None), REMOVED: (REMOVED_FILL, WRONG_COLOR, (3, 2)),
+    ADD: (ADDED_COLOR, "", None),
+}
+UNJUDGED_STYLE = (UNJUDGED_COLOR, "", None)
 
 
-def _human_color(status: int) -> str:
-    if status in (MATCHED, DISPLACED):
-        return CORRECT_COLOR
-    if status == REMOVE:
-        return WRONG_COLOR
-    return ADDED_COLOR if status == ADD else UNJUDGED_COLOR
-
-
-class ComparisonWindow(tk.Toplevel):
-    def __init__(self, master: tk.Misc, comparison: Comparison, title: str) -> None:
+class EditorWindow(tk.Toplevel):
+    def __init__(self, master: tk.Misc, session: EditSession, title: str,
+                 project_path: Path | None = None, notice: str = "") -> None:
         super().__init__(master)
-        self.title(title)
-        self.geometry("1180x860")
-        self.minsize(700, 520)
-        self.comp = comparison
+        self._title = title
+        self.geometry("1240x860")
+        self.minsize(1000, 520)
+        self.session = session
+        self.comp = comparison = session.view()  # the comparison with the applied edits reflected
+        self.project_path = project_path
+        self._notice = notice
         self._pps = 40.0  # pixels per second
         self._t0 = comparison.t_min  # time at the left edge of the rolls
         self._vis_rows = self._rows_total()  # pitches shown from top to bottom of a roll
@@ -70,7 +87,6 @@ class ComparisonWindow(tk.Toplevel):
         self._press: dict | None = None
         self._pan: tuple[float, float, float, int] | None = None
         self._ready = False
-        self._human_colors = np.array([_human_color(int(s)) for s in comparison.human.status])
         self._only_missing = tk.BooleanVar(self, False)
         self._show_correct = tk.BooleanVar(self, True)
         self._show_wrong = tk.BooleanVar(self, True)
@@ -80,6 +96,12 @@ class ComparisonWindow(tk.Toplevel):
         self._recompute_shown()
 
         self._build()
+        self._update_actions()
+        self._update_title()
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.canvas.focus_set()
+        if notice:
+            self.info.configure(text=notice)
 
     # ---- widgets --------------------------------------------------------------
 
@@ -110,6 +132,18 @@ class ComparisonWindow(tk.Toplevel):
             ttk.Button(bar, text=text, width=3, command=lambda f=factor: self._zoom_pitch(f)).pack(side="left", padx=2)
         ttk.Button(bar, text="Fit", width=5, command=self._fit).pack(side="left", padx=(12, 0))
 
+        # Pack right to left: Export, Save, [Clean Selection], Redo, Undo.
+        self.export_button = ttk.Button(bar, text="Export cleaned MIDI", command=self.export_midi)
+        self.export_button.pack(side="right", padx=(4, 0))
+        self.save_button = ttk.Button(bar, text="Save Project", command=self.save)
+        self.save_button.pack(side="right", padx=(12, 0))
+        self.redo_button = ttk.Button(bar, text="Redo", width=6, command=self.redo)
+        self.redo_button.pack(side="right", padx=(4, 0))
+        self.undo_button = ttk.Button(bar, text="Undo", width=6, command=self.undo)
+        self.undo_button.pack(side="right", padx=(4, 0))
+        self.clean_button = ttk.Button(bar, text="Clean Selection", command=self.clean_selection)
+        self._clean_before = self.redo_button  # where the Clean Selection button goes when it appears
+
         self.canvas = tk.Canvas(self, background="white", highlightthickness=0)
         self.canvas.grid(row=2, column=0, sticky="nsew", padx=(10, 0))
         self.vscroll = ttk.Scrollbar(self, orient="vertical", command=self._vscroll_command)
@@ -130,6 +164,13 @@ class ComparisonWindow(tk.Toplevel):
         for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             c.bind(sequence, self._on_wheel)
         self.bind("<Escape>", lambda _e: self._set_selection({"p": set(), "h": set()}))
+        for sequences, command in ((("<Control-z>", "<Control-Z>"), self.undo),
+                                   (("<Control-y>", "<Control-Y>", "<Control-Shift-Z>", "<Control-Shift-z>"), self.redo),
+                                   (("<Control-s>", "<Control-S>"), self.save),
+                                   (("<Control-e>", "<Control-E>"), self.export_midi),
+                                   (("<Control-a>", "<Control-A>"), self.select_all)):
+            for sequence in sequences:
+                self.bind(sequence, lambda _e, run=command: (run(), "break")[1])
         self.info.bind("<Configure>", lambda e: self.info.configure(wraplength=max(e.width - 20, 200)))
 
     def _filter(self, parent: tk.Misc, color: str, text: str, var: tk.BooleanVar) -> None:
@@ -267,11 +308,10 @@ class ComparisonWindow(tk.Toplevel):
     def _recompute_shown(self) -> None:
         """Which notes of each roll the filter checkboxes currently let through."""
         p_status, h_status = self.comp.perfect.status, self.comp.human.status
-        self._shown["p"] = (~np.isin(p_status, (MATCHED, DISPLACED)) if self._only_missing.get()
+        self._shown["p"] = (~np.isin(p_status, CORRECT) if self._only_missing.get()  # inserted = no longer missing
                             else np.ones(len(p_status), bool))
-        correct = np.isin(h_status, (MATCHED, DISPLACED))
-        self._shown["h"] = ((correct & self._show_correct.get())
-                            | ((h_status == REMOVE) & self._show_wrong.get())
+        self._shown["h"] = ((np.isin(h_status, CORRECT) & self._show_correct.get())
+                            | (np.isin(h_status, WRONG) & self._show_wrong.get())
                             | ((h_status == ADD) & self._show_added.get())
                             | (~np.isin(h_status, JUDGED) & self._show_unjudged.get()))
 
@@ -341,15 +381,16 @@ class ComparisonWindow(tk.Toplevel):
         x2 = np.maximum(self._x(roll.end[visible]), x1 + 2.0)
         y1 = self._y(side, roll.pitches[visible]) + (0.5 if self._row_h >= 4 else 0.0)
         height = self._row_h - (1.0 if self._row_h >= 4 else 0.0)
-        colors = self._human_colors[visible] if side == "h" else None
         marked = highlight[side]
         create, items = self.canvas.create_rectangle, self._items
         for n, i in enumerate(visible):
             i = int(i)
-            on = i in marked
-            item = create(x1[n], y1[n], x2[n], y1[n] + height,
-                          fill=colors[n] if colors is not None else PERFECT_COLOR,
-                          outline="black" if on else "", width=1)
+            fill, outline, dash = HUMAN_STYLE.get(int(roll.status[i]), UNJUDGED_STYLE) if side == "h" \
+                else (PERFECT_COLOR, "", None)
+            if i in marked:
+                outline, dash = "black", None
+            item = create(x1[n], y1[n], x2[n], y1[n] + height, fill=fill, outline=outline, width=1,
+                          **({"dash": dash} if dash else {}))
             items[item] = (side, i)
 
     def _draw_links(self, width: int) -> None:
@@ -427,6 +468,11 @@ class ComparisonWindow(tk.Toplevel):
         self._sel = selection
         self._redraw()
         self.info.configure(text=self._summary())
+        self._update_actions()
+
+    def select_all(self) -> None:
+        """Select every note the filters currently show, in both rolls."""
+        self._set_selection({side: {int(i) for i in np.flatnonzero(self._shown[side])} for side in "ph"})
 
     def _summary(self) -> str:
         p_sel, h_sel = self._sel["p"], self._sel["h"]
@@ -435,8 +481,8 @@ class ComparisonWindow(tk.Toplevel):
         if len(p_sel) + len(h_sel) == 1:
             side = "h" if h_sel else "p"
             return describe_note(self.comp, side, next(iter(h_sel or p_sel)))
-        wrong = sum(int(self.comp.human.status[h]) == REMOVE for h in h_sel)
-        lonely_p = sum(int(self.comp.perfect.status[p]) not in (MATCHED, DISPLACED) for p in p_sel)
+        wrong = sum(int(self.comp.human.status[h]) == REMOVE for h in h_sel)  # still to be removed
+        lonely_p = sum(int(self.comp.perfect.status[p]) not in CORRECT for p in p_sel)
         text = (f"{len(p_sel) + len(h_sel):,} notes selected ({len(p_sel):,} perfect, {len(h_sel):,} human); "
                 f"{len(self._pairs()):,} matching pair(s) drawn.")
         if wrong:
@@ -445,9 +491,111 @@ class ComparisonWindow(tk.Toplevel):
             text += f" {lonely_p:,} selected perfect note(s) are missing from the performance."
         return text
 
+    # ---- editing --------------------------------------------------------------
+
+    def _title_text(self) -> str:
+        name = f" [{self.project_path.name}]" if self.project_path else ""
+        return f"Editor: {self._title}{name}{' *' if self.session.dirty else ''}"
+
+    def _update_title(self) -> None:
+        self.title(self._title_text())
+
+    def _update_actions(self) -> None:
+        """Show or hide Clean Selection and enable the buttons that can do something now."""
+        session = self.session
+        remove, add = session.effect_of(self._sel["p"], self._sel["h"])
+        if self._sel["p"] or self._sel["h"]:
+            todo = " + ".join(part for part in (f"remove {len(remove):,}" if remove else "",
+                                               f"add {len(add):,}" if add else "") if part)
+            self.clean_button.configure(text=f"Clean Selection ({todo or 'nothing to do'})")
+            self.clean_button.state(["!disabled" if remove or add else "disabled"])
+            if not self.clean_button.winfo_manager():  # not shown yet
+                self.clean_button.pack(side="right", padx=(12, 0), before=self._clean_before)
+        else:
+            self.clean_button.pack_forget()
+        self.undo_button.state(["!disabled" if session.undo_label is not None else "disabled"])
+        self.redo_button.state(["!disabled" if session.redo_label is not None else "disabled"])
+        self.export_button.state(["!disabled" if session.state.count else "disabled"])
+        self._update_title()
+
+    def _edited(self, message: str) -> None:
+        """The applied edits changed: redraw from the new statuses and say what happened."""
+        self.comp = self.session.view()
+        self._recompute_shown()
+        self._sel = {side: {i for i in ids if self._shown[side][i]} for side, ids in self._sel.items()}
+        self._redraw()
+        self._update_actions()
+        self.info.configure(text=message)
+
+    def clean_selection(self) -> None:
+        label = self.session.clean(self._sel["p"], self._sel["h"])
+        if label is not None:
+            self._edited(f"{label}. Ctrl+Z undoes it.")
+
+    def undo(self) -> None:
+        label = self.session.undo()
+        if label is not None:
+            self._edited(f"Undid: {label}.")
+
+    def redo(self) -> None:
+        label = self.session.redo()
+        if label is not None:
+            self._edited(f"Redid: {label}.")
+
+    def save(self) -> bool:
+        """Save the project (asking where the first time); True if it was saved."""
+        path = self.project_path or dialogs.ask_project_save_path(self, self.session.human.path)
+        if path is None:
+            return False
+        try:
+            save_project(path, self.session)
+        except OSError as exc:
+            messagebox.showerror("Save failed", f"Could not save the project:\n{exc}", parent=self)
+            return False
+        self.project_path = path
+        self.session.mark_saved()
+        self._update_title()
+        self.info.configure(text=f"Saved project {path} ({self.session.state.count:,} edit(s)).")
+        return True
+
+    def export_midi(self) -> None:
+        session = self.session
+        if not session.state.count:
+            self.info.configure(text="Nothing to export yet: use Clean Selection first.")
+            return
+        try:
+            cleaned = session.build_midi()
+        except Exception as exc:
+            messagebox.showerror("Export failed", f"Could not build the cleaned MIDI:\n{exc}", parent=self)
+            return
+        target = dialogs.ask_midi_save_path(self, session.human.path, "Export cleaned MIDI")
+        if target is None:
+            return
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            cleaned.save(str(target))
+        except OSError as exc:
+            messagebox.showerror("Export failed", f"Could not save the file:\n{exc}", parent=self)
+            return
+        state = session.state
+        self.info.configure(text=f"Exported {target} (removed {len(state.removed):,} note(s), "
+                                 f"added {len(state.added):,}).")
+
+    def close(self) -> bool:
+        """Close the window, offering to save unsaved edits first; False if the user backed out."""
+        if self.session.dirty:
+            answer = messagebox.askyesnocancel(
+                "Unsaved edits", "This editor has edits that are not saved in a project.\n\n"
+                "Save the project before closing?", parent=self)
+            if answer is None or (answer and not self.save()):
+                return False
+        self.destroy()
+        return True
+
     # ---- mouse ----------------------------------------------------------------
 
     def _on_press(self, event) -> None:
+        self.canvas.focus_set()  # so the keyboard shortcuts reach this window
         self._press = {"x": event.x, "y": event.y, "moved": False, "extend": bool(event.state & SHIFT)}
 
     def _on_drag(self, event) -> None:
