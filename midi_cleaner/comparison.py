@@ -21,7 +21,12 @@ NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 
 @dataclass(frozen=True)
 class Roll:
-    """One piano roll: every array is indexed like the notes of its MidiData."""
+    """One piano roll: every array is indexed like the notes of its MidiData.
+
+    The human roll continues past the file's own notes with the notes the cleaner would add
+    (status ADD); they are not in the file, only a proposal, and point at the perfect note
+    they come from.
+    """
 
     pitches: np.ndarray
     start: np.ndarray  # seconds on the shared timeline
@@ -88,13 +93,29 @@ def build_comparison(perfect: MidiData, human: MidiData, alignment: Alignment,
     p_off = p_on + np.maximum(perfect.offsets - perfect.onsets, 0.0) * scale
 
     h_rel_off = human.offsets - human.start
-    pitch_lo = int(min(perfect.pitches.min(), human.pitches.min()))
-    pitch_hi = int(max(perfect.pitches.max(), human.pitches.max()))
+
+    # Proposed additions follow the real notes in the human roll, each paired with its source.
+    n_real = len(ht)
+    source = plan.add_source if plan.add_source is not None else np.zeros(0, int)
+    add_pitch = np.array([n.pitch for n in plan.add], dtype=int)
+    add_on = np.array([n.onset for n in plan.add], dtype=float) - human.start
+    add_off = add_on + np.array([n.duration for n in plan.add], dtype=float)
+    p_partner = p_partner.copy()
+    p_partner[source] = n_real + np.arange(len(source))
+
+    h_pitches = np.concatenate([human.pitches, add_pitch])
+    h_on = np.concatenate([ht, add_on])
+    h_off = np.concatenate([h_rel_off, add_off])
+    h_status = np.concatenate([h_status, np.full(len(source), ADD, h_status.dtype)])
+    h_partner = np.concatenate([h_partner, source])
+
+    pitch_lo = int(min(perfect.pitches.min(), h_pitches.min()))
+    pitch_hi = int(max(perfect.pitches.max(), h_pitches.max()))
     return Comparison(
         perfect=Roll(perfect.pitches, p_on, p_off, pt, p_status, p_partner),
-        human=Roll(human.pitches, ht, h_rel_off, ht, h_status, h_partner),
-        t_min=float(min(p_on.min(), ht.min(), 0.0)),
-        t_max=float(max(p_off.max(), h_rel_off.max())),
+        human=Roll(h_pitches, h_on, h_off, h_on, h_status, h_partner),
+        t_min=float(min(p_on.min(), h_on.min(), 0.0)),
+        t_max=float(max(p_off.max(), h_off.max())),
         pitch_lo=pitch_lo,
         pitch_hi=max(pitch_hi, pitch_lo + 11),  # never less than an octave tall
     )
@@ -103,6 +124,8 @@ def build_comparison(perfect: MidiData, human: MidiData, alignment: Alignment,
 # ---- explaining a note -----------------------------------------------------------
 
 HUMAN_MEANING = {
+    ADD: "to be added: the score has this note and the performance lacks it "
+         "(Add notes would insert it here, this is only a proposal)",
     MATCHED: "correct, it is in the perfect source",
     DISPLACED: "the right note, but its timing is well off the score",
     REMOVE: "wrong, it is not in the perfect source (Remove notes would delete it)",
@@ -112,7 +135,7 @@ HUMAN_MEANING = {
 PERFECT_MEANING = {
     MATCHED: "the human played it",
     DISPLACED: "the human played it, but well off the score's timing",
-    ADD: "missing from the performance (Add notes would insert it)",
+    ADD: "missing from the performance (Add notes would insert it where the blue note is)",
     HELD: "no match found, but it could not be placed safely, so it was left alone",
     UNTRUSTED: "no match found, but the alignment here is too uncertain to call it missing",
     OUTSIDE: "outside the part of the piece that could be aligned, so it was not judged",
@@ -126,7 +149,7 @@ def describe_note(comp: Comparison, side: str, index: int) -> str:
     meaning = (HUMAN_MEANING if side == "h" else PERFECT_MEANING)[int(own.status[index])]
     text = f"{who} {note_name(int(own.pitches[index]))} at {own.file_time[index]:.2f} s: {meaning}."
     partner = int(own.partner[index])
-    if partner >= 0:
+    if partner >= 0 and int(own.status[index]) != ADD:
         h, p = (index, partner) if side == "h" else (partner, index)
         lag = comp.human.start[h] - comp.perfect.start[p]
         text += (f" Paired with the {other_who} note at {other.file_time[partner]:.2f} s; "

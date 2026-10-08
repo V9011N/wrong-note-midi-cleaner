@@ -87,9 +87,17 @@ how the two files' notes pair up. It is a separate window and never opens by its
 - Human notes are **green** when they match a note of the score, **red** when the score doesn't
   have them (the ones *Remove notes* would delete) and **grey** when the cleaner couldn't tell
   (the alignment there is too uncertain, or the part of the piece wasn't aligned).
-- **Click** any note, in either roll, to draw a line to its counterpart; the status bar explains
-  what the note is. **Drag a box** to select a group and draw every line at once (hold Shift to
-  add to a selection). Scroll to pan, Ctrl+scroll to zoom, right-drag to pan, Esc to clear.
+- Each roll has its own **filters**. Perfect source: *Show only notes missing in target MIDI*
+  (every source note the performance lacks). Human: *Show correct notes*, *Show wrong notes*,
+  *Show notes to be added* and *Show not-judged notes*. The **blue** notes are the ones *Add
+  notes* would insert, drawn where it would put them; they are a proposal, not in the file, and
+  are hidden until ticked. Hiding a note also hides its line.
+- **Click** any note, in either roll, to draw a line to its counterpart (for a missing source
+  note, the blue note that would fill it); the status bar explains what the note is. **Drag a
+  box** to select a group and draw every line at once (hold Shift to add to a selection).
+- **Zoom and pan** apply to both rolls together so pitches stay lined up. Scroll pans in time,
+  Shift+scroll in pitch; Ctrl+scroll zooms in time, Ctrl+Shift+scroll in pitch (the buttons and
+  scrollbars do the same); right-drag pans both ways; Esc clears the selection.
 
 ## Measured so far
 

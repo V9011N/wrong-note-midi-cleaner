@@ -58,6 +58,7 @@ class CleaningPlan:
     human_partner: np.ndarray | None = None  # per human note: its perfect note (matched or displaced), else -1
     perfect_status: np.ndarray | None = None  # per perfect note
     perfect_partner: np.ndarray | None = None  # per perfect note: its human note (matched or displaced), else -1
+    add_source: np.ndarray | None = None  # per entry of `add`: the perfect note it was made from
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -240,6 +241,7 @@ def plan_cleaning(perfect: MidiData, human: MidiData, alignment: Alignment) -> C
         human_partner=h_partner,
         perfect_status=p_status,
         perfect_partner=p_partner,
+        add_source=np.array(added_p, dtype=int),
     )
 
 

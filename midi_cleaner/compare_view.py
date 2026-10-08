@@ -1,8 +1,9 @@
 """The comparison window: the perfect source's piano roll above the human performance's.
 
-Human notes are green when they match the score, red when the score doesn't have them and grey
-when the cleaner could not tell. Click a note, or drag a box around several, to draw a line to
-each note's counterpart in the other roll.
+Human notes are green when they match the score, red when the score doesn't have them, blue
+when they are notes the cleaner would add, and grey when it could not tell. Click a note, or
+drag a box around several, to draw a line to each note's counterpart in the other roll. Each
+roll has its own filters, and both rolls share one zoom and scroll position.
 """
 
 from __future__ import annotations
@@ -12,13 +13,14 @@ from tkinter import ttk
 
 import numpy as np
 
-from .cleaning import DISPLACED, MATCHED, REMOVE
+from .cleaning import ADD, DISPLACED, MATCHED, REMOVE
 from .comparison import Comparison, Roll, describe_note, note_name
 
-PERFECT_COLOR = "#5b7fa8"
+PERFECT_COLOR = "#555b66"  # neutral, so that blue stays "to be added"
 CORRECT_COLOR = "#2e9e4f"
 WRONG_COLOR = "#d62f2f"
-UNJUDGED_COLOR = "#9a9a9a"
+ADDED_COLOR = "#1f6fe0"
+UNJUDGED_COLOR = "#a8a8a8"
 LINK_COLOR = "#111111"
 PANEL_BG, BLACK_KEY_BG = "#fbfbfc", "#eef0f4"
 GRID_COLOR, OCTAVE_COLOR = "#dfe2e8", "#b4bac6"
@@ -29,37 +31,53 @@ TITLE = 18
 GAP = 46  # between the rolls: room for the human roll's title and the lines
 MARGIN = 10
 MIN_PPS, MAX_PPS = 6.0, 500.0  # pixels per second
+MIN_ROWS = 8  # fewest pitches the vertical zoom shows
+MAX_ROW_H = 36.0
+LABEL_ALL_ROWS_H = 12.0  # rows at least this tall name every pitch, not just the Cs
 DRAG_THRESHOLD = 4
 HIT_RADIUS = 2
 TICK_STEPS = (0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800)
 SHIFT, CONTROL = 0x1, 0x4
-HINT = ("Click a note to see its match, or drag a box to select a group. "
-        "Scroll to pan, Ctrl+scroll to zoom, right-drag to pan, Esc to clear.")
+HINT = ("Click a note to see its match, or drag a box to select a group. Scroll pans in time, "
+        "Shift+scroll in pitch; Ctrl+scroll zooms in time, Ctrl+Shift+scroll in pitch; "
+        "right-drag pans; Esc clears.")
+JUDGED = (MATCHED, DISPLACED, REMOVE, ADD)  # human statuses with their own filter
 
 
 def _human_color(status: int) -> str:
     if status in (MATCHED, DISPLACED):
         return CORRECT_COLOR
-    return WRONG_COLOR if status == REMOVE else UNJUDGED_COLOR
+    if status == REMOVE:
+        return WRONG_COLOR
+    return ADDED_COLOR if status == ADD else UNJUDGED_COLOR
 
 
 class ComparisonWindow(tk.Toplevel):
     def __init__(self, master: tk.Misc, comparison: Comparison, title: str) -> None:
         super().__init__(master)
         self.title(title)
-        self.geometry("1180x780")
-        self.minsize(640, 420)
+        self.geometry("1180x860")
+        self.minsize(700, 520)
         self.comp = comparison
         self._pps = 40.0  # pixels per second
         self._t0 = comparison.t_min  # time at the left edge of the rolls
+        self._vis_rows = self._rows_total()  # pitches shown from top to bottom of a roll
+        self._p_top = comparison.pitch_hi  # the highest pitch shown
         self._row_h = 6.0
         self._top = {"p": 0.0, "h": 0.0}  # canvas y of each roll's top edge
         self._sel: dict[str, set[int]] = {"p": set(), "h": set()}
         self._items: dict[int, tuple[str, int]] = {}  # canvas item -> (roll, note index)
         self._press: dict | None = None
-        self._pan: tuple[float, float] | None = None
+        self._pan: tuple[float, float, float, int] | None = None
         self._ready = False
         self._human_colors = np.array([_human_color(int(s)) for s in comparison.human.status])
+        self._only_missing = tk.BooleanVar(self, False)
+        self._show_correct = tk.BooleanVar(self, True)
+        self._show_wrong = tk.BooleanVar(self, True)
+        self._show_added = tk.BooleanVar(self, False)
+        self._show_unjudged = tk.BooleanVar(self, True)
+        self._shown: dict[str, np.ndarray] = {}  # per roll: which notes the filters let through
+        self._recompute_shown()
 
         self._build()
 
@@ -67,23 +85,39 @@ class ComparisonWindow(tk.Toplevel):
 
     def _build(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=1)
 
-        bar = ttk.Frame(self, padding=(10, 8, 10, 4))
-        bar.grid(row=0, column=0, sticky="ew")
-        for text, color in (("Perfect source", PERFECT_COLOR), ("Human: correct", CORRECT_COLOR),
-                            ("Human: wrong", WRONG_COLOR), ("Human: not judged", UNJUDGED_COLOR)):
-            tk.Label(bar, text=f" {text} ", bg=color, fg="white").pack(side="left", padx=(0, 6))
-        for text, command in (("Fit", self._fit), ("+", lambda: self._zoom(1.5)),
-                              ("−", lambda: self._zoom(1 / 1.5))):
-            ttk.Button(bar, text=text, width=4, command=command).pack(side="right", padx=(4, 0))
+        filters = ttk.Frame(self, padding=(10, 8, 10, 0))
+        filters.grid(row=0, column=0, columnspan=2, sticky="ew")
+        perfect_box = ttk.LabelFrame(filters, text="Perfect source (top)", padding=(8, 2, 8, 4))
+        perfect_box.pack(side="left", padx=(0, 10))
+        self._filter(perfect_box, PERFECT_COLOR, "Show only notes missing in target MIDI", self._only_missing)
+        human_box = ttk.LabelFrame(filters, text="Human performance (bottom)", padding=(8, 2, 8, 4))
+        human_box.pack(side="left")
+        for color, text, var in ((CORRECT_COLOR, "Show correct notes", self._show_correct),
+                                 (WRONG_COLOR, "Show wrong notes", self._show_wrong),
+                                 (ADDED_COLOR, "Show notes to be added", self._show_added),
+                                 (UNJUDGED_COLOR, "Show not-judged notes", self._show_unjudged)):
+            self._filter(human_box, color, text, var)
+
+        bar = ttk.Frame(self, padding=(10, 6, 10, 2))
+        bar.grid(row=1, column=0, columnspan=2, sticky="ew")
+        ttk.Label(bar, text="Zoom time").pack(side="left")
+        for text, factor in (("\u2212", 1 / 1.5), ("+", 1.5)):
+            ttk.Button(bar, text=text, width=3, command=lambda f=factor: self._zoom(f)).pack(side="left", padx=2)
+        ttk.Label(bar, text="  Zoom pitch").pack(side="left")
+        for text, factor in (("\u2212", 1 / 1.5), ("+", 1.5)):
+            ttk.Button(bar, text=text, width=3, command=lambda f=factor: self._zoom_pitch(f)).pack(side="left", padx=2)
+        ttk.Button(bar, text="Fit", width=5, command=self._fit).pack(side="left", padx=(12, 0))
 
         self.canvas = tk.Canvas(self, background="white", highlightthickness=0)
-        self.canvas.grid(row=1, column=0, sticky="nsew", padx=10)
+        self.canvas.grid(row=2, column=0, sticky="nsew", padx=(10, 0))
+        self.vscroll = ttk.Scrollbar(self, orient="vertical", command=self._vscroll_command)
+        self.vscroll.grid(row=2, column=1, sticky="ns", padx=(0, 10))
         self.scroll = ttk.Scrollbar(self, orient="horizontal", command=self._scroll_command)
-        self.scroll.grid(row=2, column=0, sticky="ew", padx=10)
+        self.scroll.grid(row=3, column=0, sticky="ew", padx=(10, 0))
         self.info = ttk.Label(self, text=HINT, wraplength=1100, justify="left", padding=(10, 6))
-        self.info.grid(row=3, column=0, sticky="ew")
+        self.info.grid(row=4, column=0, columnspan=2, sticky="ew")
 
         c = self.canvas
         c.bind("<Configure>", self._on_resize)
@@ -98,6 +132,12 @@ class ComparisonWindow(tk.Toplevel):
         self.bind("<Escape>", lambda _e: self._set_selection({"p": set(), "h": set()}))
         self.info.bind("<Configure>", lambda e: self.info.configure(wraplength=max(e.width - 20, 200)))
 
+    def _filter(self, parent: tk.Misc, color: str, text: str, var: tk.BooleanVar) -> None:
+        """A checkbox led by a swatch of the colour it controls."""
+        tk.Label(parent, width=2, bg=color).pack(side="left", padx=(0, 3))
+        ttk.Checkbutton(parent, text=text, variable=var, command=self._on_filters_changed
+                        ).pack(side="left", padx=(0, 12))
+
     # ---- geometry -------------------------------------------------------------
 
     def _x(self, t):
@@ -107,7 +147,14 @@ class ComparisonWindow(tk.Toplevel):
         return self._t0 + (x - GUTTER) / self._pps
 
     def _y(self, side: str, pitch):
-        return self._top[side] + (self.comp.pitch_hi - pitch) * self._row_h
+        """Top edge of a pitch's row (the pitch at the top of the roll is row 0)."""
+        return self._top[side] + (self._p_top - pitch) * self._row_h
+
+    def _bottom(self, side: str) -> float:
+        return self._top[side] + self._vis_rows * self._row_h
+
+    def _rows_total(self) -> int:
+        return self.comp.pitch_hi - self.comp.pitch_lo + 1
 
     def _span(self) -> float:
         """Seconds of music visible across the rolls."""
@@ -119,42 +166,60 @@ class ComparisonWindow(tk.Toplevel):
     def _clamp_view(self) -> None:
         lo, hi = self._bounds()
         self._t0 = min(max(self._t0, lo), max(hi - self._span(), lo))
+        total = self._rows_total()
+        self._vis_rows = int(min(max(self._vis_rows, min(MIN_ROWS, total)), total))
+        self._p_top = int(min(max(self._p_top, self.comp.pitch_lo + self._vis_rows - 1), self.comp.pitch_hi))
 
     def _layout(self) -> None:
-        rows = self.comp.pitch_hi - self.comp.pitch_lo + 1
         free = self.canvas.winfo_height() - RULER - TITLE - GAP - MARGIN
-        self._row_h = float(np.clip(free / (2 * rows), 1.5, 10.0))
+        self._row_h = float(min(max(free / (2 * self._vis_rows), 1.0), MAX_ROW_H))
         self._top["p"] = RULER + TITLE
-        self._top["h"] = self._top["p"] + rows * self._row_h + GAP
+        self._top["h"] = self._top["p"] + self._vis_rows * self._row_h + GAP
+
+    def _refresh(self) -> None:
+        self._clamp_view()
+        self._layout()
+        self._redraw()
 
     def _on_resize(self, _event) -> None:
-        self._layout()
         if not self._ready:
             self._ready = True
             self._fit()
             return
-        self._clamp_view()
-        self._redraw()
+        self._refresh()
 
     # ---- view changes ---------------------------------------------------------
 
     def _fit(self) -> None:
-        """Show the whole piece if it is short enough to read, else its first minute or so."""
+        """Show every pitch, and the whole piece if it is short enough to read, else its start."""
         lo, hi = self._bounds()
         width = max(self.canvas.winfo_width() - GUTTER, 1)
         self._pps = float(np.clip(width / (hi - lo), MIN_PPS, MAX_PPS))
         self._t0 = lo
-        self._clamp_view()
-        self._redraw()
+        self._vis_rows, self._p_top = self._rows_total(), self.comp.pitch_hi
+        self._refresh()
 
     def _zoom(self, factor: float, anchor_x: float | None = None) -> None:
+        """Zoom the time axis about a canvas x (default: the middle)."""
         if anchor_x is None:
             anchor_x = GUTTER + (self.canvas.winfo_width() - GUTTER) / 2
         anchor_t = self._t(anchor_x)
         self._pps = float(np.clip(self._pps * factor, MIN_PPS, MAX_PPS))
         self._t0 = anchor_t - (anchor_x - GUTTER) / self._pps
-        self._clamp_view()
-        self._redraw()
+        self._refresh()
+
+    def _zoom_pitch(self, factor: float, anchor_y: float | None = None) -> None:
+        """Zoom the pitch axis (both rolls together) about a canvas y (default: the middle)."""
+        side = "h" if anchor_y is not None and anchor_y > (self._bottom("p") + self._top["h"]) / 2 else "p"
+        fraction = 0.5 if anchor_y is None else float(np.clip(
+            (anchor_y - self._top[side]) / (self._vis_rows * self._row_h), 0.0, 1.0))
+        anchor_pitch = self._p_top - fraction * self._vis_rows
+        rows = int(round(self._vis_rows / factor))
+        if rows == self._vis_rows:  # always move at least one row
+            rows += -1 if factor > 1 else 1
+        self._vis_rows = min(max(rows, min(MIN_ROWS, self._rows_total())), self._rows_total())
+        self._p_top = int(round(anchor_pitch + fraction * self._vis_rows))
+        self._refresh()
 
     def _scroll_command(self, kind: str, *args: str) -> None:
         lo, hi = self._bounds()
@@ -163,29 +228,57 @@ class ComparisonWindow(tk.Toplevel):
         elif kind == "scroll":
             step = self._span() * (0.9 if args[1] == "pages" else 0.1)
             self._t0 += int(args[0]) * step
-        self._clamp_view()
-        self._redraw()
+        self._refresh()
+
+    def _vscroll_command(self, kind: str, *args: str) -> None:
+        if kind == "moveto":
+            self._p_top = self.comp.pitch_hi - int(round(float(args[0]) * self._rows_total()))
+        elif kind == "scroll":
+            step = self._vis_rows - 1 if args[1] == "pages" else max(self._vis_rows // 10, 1)
+            self._p_top -= int(args[0]) * step  # scrolling down reveals lower pitches
+        self._refresh()
 
     def _on_wheel(self, event) -> None:
-        if event.num == 4 or (event.num != 5 and event.delta > 0):
-            direction = 1
-        else:
-            direction = -1
-        if event.state & CONTROL:
+        direction = 1 if event.num == 4 or (event.num != 5 and event.delta > 0) else -1
+        control, shift = bool(event.state & CONTROL), bool(event.state & SHIFT)
+        if control and shift:
+            self._zoom_pitch(1.25 ** direction, event.y)
+        elif control:
             self._zoom(1.25 ** direction, event.x)
+        elif shift:
+            self._p_top += direction * max(self._vis_rows // 10, 1)
+            self._refresh()
         else:
             self._t0 -= direction * self._span() * 0.1
-            self._clamp_view()
-            self._redraw()
+            self._refresh()
 
     def _on_pan_start(self, event) -> None:
-        self._pan = (event.x, self._t0)
+        self._pan = (event.x, event.y, self._t0, self._p_top)
 
     def _on_pan_move(self, event) -> None:
         if self._pan is not None:
-            self._t0 = self._pan[1] - (event.x - self._pan[0]) / self._pps
-            self._clamp_view()
-            self._redraw()
+            x0, y0, t0, p_top = self._pan
+            self._t0 = t0 - (event.x - x0) / self._pps
+            self._p_top = p_top + int(round((event.y - y0) / self._row_h))  # the roll follows the pointer
+            self._refresh()
+
+    # ---- filters --------------------------------------------------------------
+
+    def _recompute_shown(self) -> None:
+        """Which notes of each roll the filter checkboxes currently let through."""
+        p_status, h_status = self.comp.perfect.status, self.comp.human.status
+        self._shown["p"] = (~np.isin(p_status, (MATCHED, DISPLACED)) if self._only_missing.get()
+                            else np.ones(len(p_status), bool))
+        correct = np.isin(h_status, (MATCHED, DISPLACED))
+        self._shown["h"] = ((correct & self._show_correct.get())
+                            | ((h_status == REMOVE) & self._show_wrong.get())
+                            | ((h_status == ADD) & self._show_added.get())
+                            | (~np.isin(h_status, JUDGED) & self._show_unjudged.get()))
+
+    def _on_filters_changed(self) -> None:
+        self._recompute_shown()
+        # a note that disappears is no longer selected, so its line goes with it
+        self._set_selection({side: {i for i in ids if self._shown[side][i]} for side, ids in self._sel.items()})
 
     # ---- drawing --------------------------------------------------------------
 
@@ -204,20 +297,25 @@ class ComparisonWindow(tk.Toplevel):
         highlight = self._highlighted()
         self._draw_notes("p", t_a, t_b, highlight)
         self._draw_notes("h", t_a, t_b, highlight)
-        self._draw_links()
-        self._update_scrollbar()
+        self._draw_links(width)
+        self._update_scrollbars()
+
+    def _visible_pitches(self) -> range:
+        return range(self._p_top - self._vis_rows + 1, self._p_top + 1)
 
     def _draw_panel(self, side: str, title: str, width: int) -> None:
-        c, comp = self.canvas, self.comp
-        top, bottom = self._top[side], self._top[side] + (comp.pitch_hi - comp.pitch_lo + 1) * self._row_h
+        c = self.canvas
+        top, bottom = self._top[side], self._bottom(side)
         c.create_text(GUTTER, top - 4, text=title, anchor="sw", fill="#444444", font=("TkDefaultFont", 9, "bold"))
         c.create_rectangle(GUTTER, top, width, bottom, fill=PANEL_BG, outline=GRID_COLOR)
-        for pitch in range(comp.pitch_lo, comp.pitch_hi + 1):
+        name_every_row = self._row_h >= LABEL_ALL_ROWS_H
+        for pitch in self._visible_pitches():
             y = self._y(side, pitch)
             if pitch % 12 in (1, 3, 6, 8, 10):
                 c.create_rectangle(GUTTER, y, width, y + self._row_h, fill=BLACK_KEY_BG, outline="")
             if pitch % 12 == 0:
                 c.create_line(GUTTER, y + self._row_h, width, y + self._row_h, fill=OCTAVE_COLOR)
+            if pitch % 12 == 0 or name_every_row:
                 c.create_text(GUTTER - 6, y + self._row_h / 2, text=note_name(pitch), anchor="e",
                               fill="#555555", font=("TkDefaultFont", 8))
 
@@ -225,20 +323,20 @@ class ComparisonWindow(tk.Toplevel):
         c = self.canvas
         step = next((s for s in TICK_STEPS if s * self._pps >= 70), TICK_STEPS[-1])
         first = int(np.ceil(max(t_a, 0.0) / step))
-        bottoms = {side: self._top[side] + (self.comp.pitch_hi - self.comp.pitch_lo + 1) * self._row_h
-                   for side in "ph"}
         for k in range(first, int(t_b / step) + 1):
             t = k * step
             x = self._x(t)
             for side in "ph":
-                c.create_line(x, self._top[side], x, bottoms[side], fill=GRID_COLOR)
+                c.create_line(x, self._top[side], x, self._bottom(side), fill=GRID_COLOR)
             label = f"{int(t // 60)}:{t % 60:02.0f}" if step >= 1 else f"{t:.2f}s"
             c.create_line(x, RULER - 5, x, RULER, fill=OCTAVE_COLOR)
             c.create_text(x + 3, RULER - 6, text=label, anchor="sw", fill="#555555", font=("TkDefaultFont", 8))
 
     def _draw_notes(self, side: str, t_a: float, t_b: float, highlight: dict[str, set[int]]) -> None:
         roll = self._roll(side)
-        visible = np.flatnonzero((roll.end >= t_a) & (roll.start <= t_b))
+        low, high = self._p_top - self._vis_rows + 1, self._p_top
+        visible = np.flatnonzero((roll.end >= t_a) & (roll.start <= t_b) & self._shown[side]
+                                 & (roll.pitches >= low) & (roll.pitches <= high))
         x1 = self._x(roll.start[visible])
         x2 = np.maximum(self._x(roll.end[visible]), x1 + 2.0)
         y1 = self._y(side, roll.pitches[visible]) + (0.5 if self._row_h >= 4 else 0.0)
@@ -254,19 +352,27 @@ class ComparisonWindow(tk.Toplevel):
                           outline="black" if on else "", width=1)
             items[item] = (side, i)
 
-    def _draw_links(self) -> None:
+    def _draw_links(self, width: int) -> None:
         comp = self.comp
+        low, high = self._p_top - self._vis_rows + 1, self._p_top
         for p, h in sorted(self._pairs()):
+            if not low <= comp.perfect.pitches[p] <= high:  # partners share a pitch, so both are off-screen
+                continue
             xp = self._x((comp.perfect.start[p] + comp.perfect.end[p]) / 2)
             xh = self._x((comp.human.start[h] + comp.human.end[h]) / 2)
+            if max(xp, xh) < GUTTER or min(xp, xh) > width:
+                continue
             yp = self._y("p", comp.perfect.pitches[p]) + self._row_h / 2
             yh = self._y("h", comp.human.pitches[h]) + self._row_h / 2
             self.canvas.create_line(xp, yp, xh, yh, fill=LINK_COLOR, width=1.5)
 
-    def _update_scrollbar(self) -> None:
+    def _update_scrollbars(self) -> None:
         lo, hi = self._bounds()
         first = (self._t0 - lo) / (hi - lo)
         self.scroll.set(first, min(first + self._span() / (hi - lo), 1.0))
+        total = self._rows_total()
+        top = (self.comp.pitch_hi - self._p_top) / total
+        self.vscroll.set(top, min(top + self._vis_rows / total, 1.0))
 
     # ---- selection ------------------------------------------------------------
 
@@ -274,15 +380,18 @@ class ComparisonWindow(tk.Toplevel):
         return self.comp.human if side == "h" else self.comp.perfect
 
     def _pairs(self) -> set[tuple[int, int]]:
-        """(perfect index, human index) of every pair reached from a selected note."""
+        """(perfect index, human index) of every pair reached from a selected note.
+
+        A pair whose other end is filtered out of its roll is left out: there is nothing to draw to.
+        """
         pairs = set()
         for h in self._sel["h"]:
             p = int(self.comp.human.partner[h])
-            if p >= 0:
+            if p >= 0 and self._shown["p"][p]:
                 pairs.add((p, h))
         for p in self._sel["p"]:
             h = int(self.comp.perfect.partner[p])
-            if h >= 0:
+            if h >= 0 and self._shown["h"][h]:
                 pairs.add((p, h))
         return pairs
 
@@ -304,10 +413,13 @@ class ComparisonWindow(tk.Toplevel):
         found: dict[str, set[int]] = {"p": set(), "h": set()}
         for side in "ph":
             roll = self._roll(side)
-            row_a = int(np.floor((y_a - self._top[side]) / self._row_h))  # rows counted from the top
-            row_b = int(np.ceil((y_b - self._top[side]) / self._row_h)) - 1
-            hit = ((roll.start <= t_b) & (roll.end >= t_a)
-                   & (roll.pitches <= self.comp.pitch_hi - row_a) & (roll.pitches >= self.comp.pitch_hi - row_b))
+            if y_b < self._top[side] or y_a > self._bottom(side):
+                continue  # the box misses this roll altogether
+            last = self._vis_rows - 1  # rows counted from the top of the roll, only those on screen
+            row_a = min(max(int(np.floor((y_a - self._top[side]) / self._row_h)), 0), last)
+            row_b = min(max(int(np.ceil((y_b - self._top[side]) / self._row_h)) - 1, 0), last)
+            hit = ((roll.start <= t_b) & (roll.end >= t_a) & self._shown[side]
+                   & (roll.pitches <= self._p_top - row_a) & (roll.pitches >= self._p_top - row_b))
             found[side] = {int(i) for i in np.flatnonzero(hit)}
         return found
 
@@ -324,13 +436,13 @@ class ComparisonWindow(tk.Toplevel):
             side = "h" if h_sel else "p"
             return describe_note(self.comp, side, next(iter(h_sel or p_sel)))
         wrong = sum(int(self.comp.human.status[h]) == REMOVE for h in h_sel)
-        lonely_p = sum(int(self.comp.perfect.partner[p]) < 0 for p in p_sel)
+        lonely_p = sum(int(self.comp.perfect.status[p]) not in (MATCHED, DISPLACED) for p in p_sel)
         text = (f"{len(p_sel) + len(h_sel):,} notes selected ({len(p_sel):,} perfect, {len(h_sel):,} human); "
                 f"{len(self._pairs()):,} matching pair(s) drawn.")
         if wrong:
             text += f" {wrong:,} selected human note(s) are wrong (red)."
         if lonely_p:
-            text += f" {lonely_p:,} selected perfect note(s) have no counterpart in the performance."
+            text += f" {lonely_p:,} selected perfect note(s) are missing from the performance."
         return text
 
     # ---- mouse ----------------------------------------------------------------
