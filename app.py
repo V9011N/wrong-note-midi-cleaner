@@ -1,7 +1,9 @@
 """Human MIDI Cleaner.
 
 Pick a perfect source and a human MIDI; the match confidence appears automatically. Then choose
-which kinds of fix may be applied (add missing notes / remove extra notes) and click Clean.
+which kinds of fix may be applied (add missing notes / remove extra notes) and click Full Clean,
+or open the editor to see how the two files' notes pair up and clean only the parts you pick.
+A project saved from the editor can be reopened with "Open Project".
 """
 
 from __future__ import annotations
@@ -13,11 +15,15 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from midi_cleaner import dialogs
 from midi_cleaner.cleaning import CleaningPlan, build_cleaned_midi, plan_cleaning
+from midi_cleaner.comparison import Comparison, build_comparison
 from midi_cleaner.confidence import LIKELY_MATCH, UNCERTAIN_MATCH, MatchResult, analyze
+from midi_cleaner.dialogs import MIDI_TYPES
+from midi_cleaner.editing import EditSession
+from midi_cleaner.editor import EditorWindow
 from midi_cleaner.loader import MidiData, MidiLoadError, load_midi
-
-MIDI_TYPES = [("MIDI files", "*.mid *.midi *.MID *.MIDI"), ("All files", "*.*")]
+from midi_cleaner.project import Project, ProjectError, load_project, restore_state
 DEBOUNCE_MS = 400
 GOOD, MIDDLE, BAD = "#1a7f37", "#b35900", "#c62828"
 
@@ -42,8 +48,13 @@ class App(tk.Tk):
         self._start_dir = Path(__file__).parent / "MIDIs"
         self.add_var = tk.BooleanVar(value=False)
         self.remove_var = tk.BooleanVar(value=False)
-        # (perfect, human, result, plan) of the finished analysis the Clean button works from
+        # (perfect, human, result, plan) of the finished analysis the Full Clean button works from
         self._analysis: tuple[MidiData, MidiData, MatchResult, CleaningPlan] | None = None
+        # (perfect, human, plan, comparison) of the same analysis, which the editor works from
+        self._context: tuple[MidiData, MidiData, CleaningPlan, Comparison] | None = None
+        self._editor: EditorWindow | None = None  # the editor open on the current analysis
+        self._editors: list[EditorWindow] = []  # every editor still open; they outlive a change of files
+        self._pending_project: tuple[Project, Path] | None = None  # to open once its files are analysed
 
         self._build_inputs()
         self._build_result()
@@ -51,6 +62,7 @@ class App(tk.Tk):
         self._refresh_cleaning()
         for var in (self.perfect_var, self.human_var):
             var.trace_add("write", lambda *_: self._schedule_analysis())
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_results)
 
     # ---- layout ---------------------------------------------------------------
@@ -65,6 +77,7 @@ class App(tk.Tk):
             ttk.Entry(frame, textvariable=var).grid(row=row, column=1, sticky="ew", padx=8)
             ttk.Button(frame, text="Browse...", command=lambda v=var, t=label: self._browse(v, t)
                        ).grid(row=row, column=2)
+        ttk.Button(frame, text="Open Project...", command=self._open_project).grid(row=2, column=2, pady=(6, 0))
 
     def _build_result(self) -> None:
         frame = ttk.LabelFrame(self, text="Match confidence", padding=10)
@@ -85,6 +98,9 @@ class App(tk.Tk):
                                font=("Consolas", 10), background=self.cget("background"))
         self.details.grid(row=3, column=0, sticky="nsew")
         frame.rowconfigure(3, weight=1)
+        self.compare_button = ttk.Button(frame, text="Open Editor...", command=self._open_editor,
+                                         state="disabled")
+        self.compare_button.grid(row=4, column=0, sticky="e", pady=(8, 0))
 
     def _build_cleaning(self) -> None:
         frame = ttk.LabelFrame(self, text="Cleaning", padding=10)
@@ -99,7 +115,7 @@ class App(tk.Tk):
                                             command=self._refresh_cleaning)
         self.add_check.grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.remove_check.grid(row=2, column=0, sticky="w")
-        self.clean_button = ttk.Button(frame, text="Clean", command=self._clean)
+        self.clean_button = ttk.Button(frame, text="Full Clean", command=self._clean)
         self.clean_button.grid(row=1, column=2, rowspan=2, sticky="e", ipadx=18, ipady=4)
 
         self.hint = ttk.Label(frame, text="", wraplength=780, justify="left", foreground="#555555")
@@ -128,6 +144,7 @@ class App(tk.Tk):
         self._debounce_id = None
         self._run_id += 1  # invalidates any analysis still running
         self._analysis = None
+        self._set_context(None)
         self.clean_status.configure(text="")
         self._refresh_cleaning()
         perfect, human = clean_path(self.perfect_var.get()), clean_path(self.human_var.get())
@@ -151,16 +168,17 @@ class App(tk.Tk):
             perfect, human = load_midi(perfect_path), load_midi(human_path)
             result, alignment = analyze(perfect, human)
             plan = plan_cleaning(perfect, human, alignment)
-            self._results.put((run_id, perfect, human, result, plan, None))
+            comparison = build_comparison(perfect, human, alignment, plan)
+            self._results.put((run_id, perfect, human, result, plan, comparison, None))
         except MidiLoadError as exc:
-            self._results.put((run_id, None, None, None, None, str(exc)))
+            self._results.put((run_id, None, None, None, None, None, str(exc)))
         except Exception as exc:  # keep the UI usable whatever the analysis hits
-            self._results.put((run_id, None, None, None, None, f"Unexpected error: {exc!r}"))
+            self._results.put((run_id, None, None, None, None, None, f"Unexpected error: {exc!r}"))
 
     def _poll_results(self) -> None:
         try:
             while True:
-                run_id, perfect, human, result, plan, error = self._results.get_nowait()
+                run_id, perfect, human, result, plan, comparison, error = self._results.get_nowait()
                 if run_id != self._run_id:
                     continue
                 self.progress.stop()
@@ -170,6 +188,8 @@ class App(tk.Tk):
                 else:
                     self._show_result(perfect, human, result)
                     self._offer_cleaning(perfect, human, result, plan)
+                    self._set_context((perfect, human, plan, comparison))
+                    self._open_pending_project()
         except queue.Empty:
             pass
         self.after(100, self._poll_results)
@@ -183,6 +203,8 @@ class App(tk.Tk):
         self.verdict.configure(text=message, foreground=color)
         self._set_details("")
         self._analysis = None
+        self._pending_project = None  # its files can't be used
+        self._set_context(None)
         self._refresh_cleaning()
 
     def _show_result(self, perfect: MidiData, human: MidiData, r: MatchResult) -> None:
@@ -212,6 +234,75 @@ class App(tk.Tk):
                 lines += ["", f"Note ({name}): {warning}"]
         self._set_details("\n".join(lines))
 
+    # ---- editor and projects --------------------------------------------------
+
+    def _set_context(self, context: tuple[MidiData, MidiData, CleaningPlan, Comparison] | None) -> None:
+        """The analysis the editor would open on. Editors already open keep their own copy."""
+        self._context = context
+        self._editor = None
+        self.compare_button.state(["!disabled" if context is not None else "disabled"])
+
+    def _open_editor(self, project: Project | None = None, project_path: Path | None = None) -> None:
+        if self._context is None:
+            return
+        if project is None and self._editor is not None and self._editor.winfo_exists():
+            self._editor.lift()
+            self._editor.focus_set()
+            return
+        perfect, human, plan, comparison = self._context
+        session = EditSession(perfect, human, plan, comparison)
+        notice = ""
+        if project is not None:
+            state, skipped = restore_state(project, session)
+            session.load_state(state)
+            notice = f"Opened project {project_path.name}: {state.count:,} edit(s) restored."
+            if skipped:
+                notice += (f" {skipped:,} saved edit(s) could not be matched to a note the cleaner proposes "
+                           "(the files or the cleaning rules changed), so they were skipped.")
+        self._editors = [e for e in self._editors if e.winfo_exists()]
+        self._editor = EditorWindow(self, session, f"{perfect.path.name}  vs  {human.path.name}",
+                                    project_path=project_path, notice=notice)
+        self._editors.append(self._editor)
+
+    def _open_project(self) -> None:
+        path = dialogs.ask_project_open_path(self, self._start_dir)
+        if path is None:
+            return
+        try:
+            project = load_project(path)
+        except ProjectError as exc:
+            messagebox.showerror("Open project", str(exc))
+            return
+        missing = project.missing_files()
+        if missing:
+            messagebox.showerror("Open project", "These files from the project could not be found:\n\n"
+                                 + "\n".join(str(m) for m in missing))
+            return
+        changed = project.changed_files()
+        if changed and not messagebox.askyesno(
+                "Files changed", "These files were modified since the project was saved: "
+                f"{', '.join(changed)}.\n\nThe saved edits may no longer line up. Open it anyway?"):
+            return
+        self._pending_project = (project, path)  # the editor opens once the two files are analysed
+        self.perfect_var.set(str(project.perfect_path))
+        self.human_var.set(str(project.human_path))
+
+    def _open_pending_project(self) -> None:
+        if self._pending_project is None or self._context is None:
+            return
+        (project, path), self._pending_project = self._pending_project, None
+        perfect, human = self._context[:2]
+        if (perfect.path.resolve(), human.path.resolve()) == (project.perfect_path.resolve(),
+                                                              project.human_path.resolve()):
+            self._open_editor(project, path)
+
+    def _on_close(self) -> None:
+        """Quit, unless an editor still holds edits the user wants to save first."""
+        for editor in [e for e in self._editors if e.winfo_exists()]:
+            if not editor.close():
+                return
+        self.destroy()
+
     # ---- cleaning -------------------------------------------------------------
 
     def _offer_cleaning(self, perfect: MidiData, human: MidiData, result: MatchResult,
@@ -225,7 +316,7 @@ class App(tk.Tk):
         self._refresh_cleaning()
 
     def _refresh_cleaning(self) -> None:
-        """Sync labels, checkbox availability and the Clean button with the current state."""
+        """Sync labels, checkbox availability and the Full Clean button with the current state."""
         if self._analysis is None:
             for widget in (self.add_check, self.remove_check, self.clean_button):
                 widget.state(["disabled"])
@@ -261,20 +352,12 @@ class App(tk.Tk):
         self.findings.configure(text=found, foreground="")
         if not (self.add_var.get() or self.remove_var.get()):
             self.clean_button.state(["disabled"])
-            self.hint.configure(text="Select at least one option to enable Clean.", foreground=BAD)
+            self.hint.configure(text="Select at least one option to enable Full Clean.", foreground=BAD)
         else:
             self.clean_button.state(["!disabled"])
             self.hint.configure(text="The options above were selected automatically from what was found. "
                                      "You may change the selection, but at least one must be chosen.",
                                 foreground="#555555")
-
-    def _ask_save_path(self, human: MidiData) -> str:
-        """Open the system file browser for the cleaned file's destination ('' if cancelled)."""
-        cleaned_dir = human.path.parent / "Cleaned"
-        return filedialog.asksaveasfilename(
-            title="Save cleaned MIDI", defaultextension=".mid", filetypes=MIDI_TYPES,
-            initialdir=cleaned_dir if cleaned_dir.is_dir() else human.path.parent,
-            initialfile=f"{human.path.stem} - CLEANED.mid")
 
     def _clean(self) -> None:
         if self._analysis is None or not (self.add_var.get() or self.remove_var.get()):
@@ -288,17 +371,10 @@ class App(tk.Tk):
             return
 
         # The browser opens only now, after the cleaning is done.
-        while True:
-            chosen = self._ask_save_path(human)
-            if not chosen:
-                self.clean_status.configure(text="Cleaning finished, but nothing was saved.", foreground=MIDDLE)
-                return
-            target = Path(chosen)
-            if target.exists() and target.resolve() == human.path.resolve():
-                messagebox.showwarning("Original file", "The original human MIDI is never overwritten. "
-                                                        "Please choose a different file name or folder.")
-                continue
-            break
+        target = dialogs.ask_midi_save_path(self, human.path)
+        if target is None:
+            self.clean_status.configure(text="Cleaning finished, but nothing was saved.", foreground=MIDDLE)
+            return
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             cleaned.save(str(target))

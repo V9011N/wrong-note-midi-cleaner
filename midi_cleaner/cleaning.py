@@ -9,7 +9,9 @@ Safeguards, because the aim is to fix mistakes without damaging the performance:
   * a leftover human note and a leftover source note of the same pitch that are fairly close
     are one *displaced* note (timing, not a wrong note) and are left alone;
   * nothing is edited where the local alignment is poorly supported, near the joins between
-    aligned segments, or in stretches the human skipped.
+    aligned segments, or in stretches the human skipped;
+  * a leftover note that re-strikes a key the score says is still held (a double-played note) is
+    removed, but the note it duplicates inherits its release, so the hold isn't cut short.
 """
 
 from __future__ import annotations
@@ -31,6 +33,8 @@ MIN_TRUST = 0.6  # edit only where at least this share of nearby notes line up
 CHORD_WINDOW = 0.04  # s: source notes this close together are one chord
 VELOCITY_WINDOW = 0.5  # s and ...
 VELOCITY_REACH = 12  # ... semitones of human notes whose velocity an added note borrows
+RESTRIKE_GAP = 0.20  # s: a same-pitch leftover this close to a held note's span is a re-strike of it
+RELEASE_GAP = 0.005  # s: an extended note ends this long before the next strike of the same key
 
 
 # Per-note outcomes recorded in the plan (also used for diagnostics).
@@ -55,8 +59,13 @@ class CleaningPlan:
     displaced: int = 0  # same note, different timing: left alone
     untrusted: int = 0  # leftovers not edited because the alignment there is poorly supported
     human_status: np.ndarray | None = None  # per human note: one of the outcomes above
-    human_partner: np.ndarray | None = None  # per human note: matched perfect note index, else -1
+    human_partner: np.ndarray | None = None  # per human note: its perfect note (matched or displaced), else -1
     perfect_status: np.ndarray | None = None  # per perfect note
+    perfect_partner: np.ndarray | None = None  # per perfect note: its human note (matched or displaced), else -1
+    add_source: np.ndarray | None = None  # per entry of `add`: the perfect note it was made from
+    # Removed re-strikes: removed human note -> (the note it duplicates, the release time, in the
+    # human file's seconds, that note takes over so the hold isn't cut short).
+    extend: dict[int, tuple[int, float]] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -148,6 +157,50 @@ def _local_trust(aligned: np.ndarray, order: np.ndarray) -> np.ndarray:
     return trust
 
 
+def _restrike_extensions(perfect: MidiData, human: MidiData, alignment: Alignment, remove: list[int],
+                         h_partner: np.ndarray, seg_of_h: np.ndarray, ht: np.ndarray
+                         ) -> dict[int, tuple[int, float]]:
+    """For each removed note that re-strikes a held note: (that note, the release it should take).
+
+    A played note that the score lacks is normally just deleted. But when it has the pitch of a
+    note that was matched and the score still holds that key down when it lands (or the
+    performer's own first strike is still down), the key was struck twice for one held note.
+    The performer's first strike is the one that matched, usually because it is closest to the
+    score's timing; deleting the second would leave it as short as that first bounce. So the note
+    it duplicates takes over the second one's release instead, never running into the next
+    strike of the same key.
+    """
+    if not remove or not np.any(h_partner >= 0):
+        return {}
+    h_off = human.offsets - human.start
+    p_off = perfect.offsets - perfect.start
+    removed = set(remove)
+    kept = np.flatnonzero(h_partner >= 0)
+    out: dict[int, tuple[int, float]] = {}
+    for pitch in np.unique(human.pitches[remove]):
+        same = np.flatnonzero(human.pitches == pitch)
+        kept_here = same[h_partner[same] >= 0]
+        if len(kept_here) == 0:
+            continue
+        kept_here = kept_here[np.argsort(ht[kept_here], kind="stable")]
+        survivors = np.sort(ht[[i for i in same if i not in removed]])  # strikes of this key that stay
+        for h in (r for r in remove if human.pitches[r] == pitch):
+            at = int(np.searchsorted(ht[kept_here], ht[h]))
+            candidates = [int(a) for a in kept_here[max(at - 1, 0):at + 1]]
+            for a in sorted(candidates, key=lambda a: abs(ht[a] - ht[h])):
+                seg = alignment.segments[int(seg_of_h[a])]
+                score_release = float(np.interp(p_off[h_partner[a]], seg.p_knots, seg.h_of_p))
+                held_until = max(float(h_off[a]), score_release)
+                if not ht[a] - RESTRIKE_GAP <= ht[h] <= held_until + RESTRIKE_GAP:
+                    continue
+                later = survivors[survivors > ht[a]]
+                release = min(float(h_off[h]), float(later[0]) - RELEASE_GAP if len(later) else np.inf)
+                if release > h_off[a]:  # nothing to hand over if the first strike already lasts as long
+                    out[int(h)] = (a, human.start + release)
+                break
+    return out
+
+
 # ---- planning ------------------------------------------------------------------
 
 def plan_cleaning(perfect: MidiData, human: MidiData, alignment: Alignment) -> CleaningPlan:
@@ -162,6 +215,7 @@ def plan_cleaning(perfect: MidiData, human: MidiData, alignment: Alignment) -> C
     h_status = np.full(len(ht), OUTSIDE, np.int8)
     h_partner = np.full(len(ht), -1, int)
     p_status = np.full(len(pt), OUTSIDE, np.int8)
+    p_partner = np.full(len(pt), -1, int)
     remove: list[int] = []
     missing: list[tuple[int, int]] = []  # (segment, perfect index) to add
     matched_pairs: list[tuple[int, int, int]] = []  # (segment, human idx, perfect idx)
@@ -176,7 +230,7 @@ def plan_cleaning(perfect: MidiData, human: MidiData, alignment: Alignment) -> C
                                 p_idx, pt[p_idx], perfect.pitches[p_idx], MATCH_TOL)
         matched_pairs += [(k, h, p) for h, p in pairs]
         for h, p in pairs:
-            h_status[h], h_partner[h], p_status[p] = MATCHED, p, MATCHED
+            h_status[h], h_partner[h], p_status[p], p_partner[p] = MATCHED, p, MATCHED, h
         done_h = {h for h, _ in pairs}
         done_p = {p for _, p in pairs}
 
@@ -187,6 +241,7 @@ def plan_cleaning(perfect: MidiData, human: MidiData, alignment: Alignment) -> C
         n_displaced += len(near)
         for h, p in near:
             h_status[h], p_status[p] = DISPLACED, DISPLACED
+            h_partner[h], p_partner[p] = p, h
         displaced_h = {h for h, _ in near}
         displaced_p = {p for _, p in near}
 
@@ -224,6 +279,7 @@ def plan_cleaning(perfect: MidiData, human: MidiData, alignment: Alignment) -> C
             else:
                 missing.append((k, int(p)))
 
+    extend = _restrike_extensions(perfect, human, alignment, remove, h_partner, seg_of_h, ht)
     notes, added_p, held_p = _build_additions(perfect, human, alignment, missing, matched_pairs, ht, pt)
     p_status[added_p] = ADD
     p_status[held_p] = HELD
@@ -236,6 +292,9 @@ def plan_cleaning(perfect: MidiData, human: MidiData, alignment: Alignment) -> C
         human_status=h_status,
         human_partner=h_partner,
         perfect_status=p_status,
+        perfect_partner=p_partner,
+        add_source=np.array(added_p, dtype=int),
+        extend=extend,
     )
 
 
@@ -323,11 +382,16 @@ def build_cleaned_midi(plan: CleaningPlan, human: MidiData,
     source = mido.MidiFile(str(human.path), clip=True)
 
     drop: set[tuple[int, int]] = set()
+    move: dict[tuple[int, int], int] = {}  # note-off event -> the tick it moves to (later, never earlier)
     if remove:
         for i in plan.remove:
             drop.add((int(human.tracks[i]), int(human.on_events[i])))
             if human.off_events[i] >= 0:
                 drop.add((int(human.tracks[i]), int(human.off_events[i])))
+            keeper, release = plan.extend.get(int(i), (-1, 0.0))
+            if keeper >= 0 and human.off_events[keeper] >= 0:  # a re-strike hands its release to the note it doubles
+                key = (int(human.tracks[keeper]), int(human.off_events[keeper]))
+                move[key] = max(move.get(key, 0), int(human.tempo_map.to_ticks(release)))
 
     # Release style: mirror the file (MAESTRO writes note_on with velocity 0).
     uses_note_off = any(m.type == "note_off" for t in source.tracks for m in t)
@@ -355,7 +419,7 @@ def build_cleaned_midi(plan: CleaningPlan, human: MidiData,
                 continue
             if msg.type == "end_of_track":
                 continue
-            events.append((tick, 1, ei, msg))
+            events.append((max(tick, move.get((ti, ei), 0)), 1, ei, msg))
         for seq, (t, order, msg) in enumerate(new_events.get(ti, [])):
             events.append((t, order, len(track) + seq, msg))
         events.sort(key=lambda e: e[:3])
