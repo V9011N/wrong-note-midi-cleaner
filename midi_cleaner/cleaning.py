@@ -55,8 +55,9 @@ class CleaningPlan:
     displaced: int = 0  # same note, different timing: left alone
     untrusted: int = 0  # leftovers not edited because the alignment there is poorly supported
     human_status: np.ndarray | None = None  # per human note: one of the outcomes above
-    human_partner: np.ndarray | None = None  # per human note: matched perfect note index, else -1
+    human_partner: np.ndarray | None = None  # per human note: its perfect note (matched or displaced), else -1
     perfect_status: np.ndarray | None = None  # per perfect note
+    perfect_partner: np.ndarray | None = None  # per perfect note: its human note (matched or displaced), else -1
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -162,6 +163,7 @@ def plan_cleaning(perfect: MidiData, human: MidiData, alignment: Alignment) -> C
     h_status = np.full(len(ht), OUTSIDE, np.int8)
     h_partner = np.full(len(ht), -1, int)
     p_status = np.full(len(pt), OUTSIDE, np.int8)
+    p_partner = np.full(len(pt), -1, int)
     remove: list[int] = []
     missing: list[tuple[int, int]] = []  # (segment, perfect index) to add
     matched_pairs: list[tuple[int, int, int]] = []  # (segment, human idx, perfect idx)
@@ -176,7 +178,7 @@ def plan_cleaning(perfect: MidiData, human: MidiData, alignment: Alignment) -> C
                                 p_idx, pt[p_idx], perfect.pitches[p_idx], MATCH_TOL)
         matched_pairs += [(k, h, p) for h, p in pairs]
         for h, p in pairs:
-            h_status[h], h_partner[h], p_status[p] = MATCHED, p, MATCHED
+            h_status[h], h_partner[h], p_status[p], p_partner[p] = MATCHED, p, MATCHED, h
         done_h = {h for h, _ in pairs}
         done_p = {p for _, p in pairs}
 
@@ -187,6 +189,7 @@ def plan_cleaning(perfect: MidiData, human: MidiData, alignment: Alignment) -> C
         n_displaced += len(near)
         for h, p in near:
             h_status[h], p_status[p] = DISPLACED, DISPLACED
+            h_partner[h], p_partner[p] = p, h
         displaced_h = {h for h, _ in near}
         displaced_p = {p for _, p in near}
 
@@ -236,6 +239,7 @@ def plan_cleaning(perfect: MidiData, human: MidiData, alignment: Alignment) -> C
         human_status=h_status,
         human_partner=h_partner,
         perfect_status=p_status,
+        perfect_partner=p_partner,
     )
 
 

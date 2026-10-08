@@ -2,6 +2,7 @@
 
 Pick a perfect source and a human MIDI; the match confidence appears automatically. Then choose
 which kinds of fix may be applied (add missing notes / remove extra notes) and click Clean.
+"Show comparison" opens a piano-roll view of how the two files' notes pair up.
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from midi_cleaner.cleaning import CleaningPlan, build_cleaned_midi, plan_cleaning
+from midi_cleaner.compare_view import ComparisonWindow
+from midi_cleaner.comparison import Comparison, build_comparison
 from midi_cleaner.confidence import LIKELY_MATCH, UNCERTAIN_MATCH, MatchResult, analyze
 from midi_cleaner.loader import MidiData, MidiLoadError, load_midi
 
@@ -44,6 +47,9 @@ class App(tk.Tk):
         self.remove_var = tk.BooleanVar(value=False)
         # (perfect, human, result, plan) of the finished analysis the Clean button works from
         self._analysis: tuple[MidiData, MidiData, MatchResult, CleaningPlan] | None = None
+        self._comparison: Comparison | None = None  # what the comparison window draws
+        self._comparison_label = ""
+        self._compare_window: ComparisonWindow | None = None
 
         self._build_inputs()
         self._build_result()
@@ -85,6 +91,9 @@ class App(tk.Tk):
                                font=("Consolas", 10), background=self.cget("background"))
         self.details.grid(row=3, column=0, sticky="nsew")
         frame.rowconfigure(3, weight=1)
+        self.compare_button = ttk.Button(frame, text="Show comparison...", command=self._show_comparison,
+                                         state="disabled")
+        self.compare_button.grid(row=4, column=0, sticky="e", pady=(8, 0))
 
     def _build_cleaning(self) -> None:
         frame = ttk.LabelFrame(self, text="Cleaning", padding=10)
@@ -128,6 +137,7 @@ class App(tk.Tk):
         self._debounce_id = None
         self._run_id += 1  # invalidates any analysis still running
         self._analysis = None
+        self._set_comparison(None)
         self.clean_status.configure(text="")
         self._refresh_cleaning()
         perfect, human = clean_path(self.perfect_var.get()), clean_path(self.human_var.get())
@@ -151,16 +161,17 @@ class App(tk.Tk):
             perfect, human = load_midi(perfect_path), load_midi(human_path)
             result, alignment = analyze(perfect, human)
             plan = plan_cleaning(perfect, human, alignment)
-            self._results.put((run_id, perfect, human, result, plan, None))
+            comparison = build_comparison(perfect, human, alignment, plan)
+            self._results.put((run_id, perfect, human, result, plan, comparison, None))
         except MidiLoadError as exc:
-            self._results.put((run_id, None, None, None, None, str(exc)))
+            self._results.put((run_id, None, None, None, None, None, str(exc)))
         except Exception as exc:  # keep the UI usable whatever the analysis hits
-            self._results.put((run_id, None, None, None, None, f"Unexpected error: {exc!r}"))
+            self._results.put((run_id, None, None, None, None, None, f"Unexpected error: {exc!r}"))
 
     def _poll_results(self) -> None:
         try:
             while True:
-                run_id, perfect, human, result, plan, error = self._results.get_nowait()
+                run_id, perfect, human, result, plan, comparison, error = self._results.get_nowait()
                 if run_id != self._run_id:
                     continue
                 self.progress.stop()
@@ -170,6 +181,7 @@ class App(tk.Tk):
                 else:
                     self._show_result(perfect, human, result)
                     self._offer_cleaning(perfect, human, result, plan)
+                    self._set_comparison(comparison, f"{perfect.path.name}  vs  {human.path.name}")
         except queue.Empty:
             pass
         self.after(100, self._poll_results)
@@ -183,6 +195,7 @@ class App(tk.Tk):
         self.verdict.configure(text=message, foreground=color)
         self._set_details("")
         self._analysis = None
+        self._set_comparison(None)
         self._refresh_cleaning()
 
     def _show_result(self, perfect: MidiData, human: MidiData, r: MatchResult) -> None:
@@ -211,6 +224,25 @@ class App(tk.Tk):
             for warning in data.warnings:
                 lines += ["", f"Note ({name}): {warning}"]
         self._set_details("\n".join(lines))
+
+    # ---- comparison view ------------------------------------------------------
+
+    def _set_comparison(self, comparison: Comparison | None, label: str = "") -> None:
+        """Keep the comparison matching the files: new files close the old window."""
+        self._comparison, self._comparison_label = comparison, label
+        if self._compare_window is not None and self._compare_window.winfo_exists():
+            self._compare_window.destroy()
+        self._compare_window = None
+        self.compare_button.state(["!disabled" if comparison is not None else "disabled"])
+
+    def _show_comparison(self) -> None:
+        if self._comparison is None:
+            return
+        if self._compare_window is not None and self._compare_window.winfo_exists():
+            self._compare_window.lift()
+            self._compare_window.focus_set()
+            return
+        self._compare_window = ComparisonWindow(self, self._comparison, f"Comparison: {self._comparison_label}")
 
     # ---- cleaning -------------------------------------------------------------
 

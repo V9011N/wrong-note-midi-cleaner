@@ -78,6 +78,19 @@ python app.py
 3. Click **Clean**. When cleaning is done a save dialog opens so you can choose where the
    result goes.
 
+Optionally, click **Show comparison...** (enabled once the files have been compared) to see
+how the two files' notes pair up. It is a separate window and never opens by itself:
+
+- The **perfect source's piano roll is on top and the human performance's below**, sharing one
+  time axis. The perfect source is laid onto the performance's timing using the alignment, so
+  matching notes sit roughly one above the other.
+- Human notes are **green** when they match a note of the score, **red** when the score doesn't
+  have them (the ones *Remove notes* would delete) and **grey** when the cleaner couldn't tell
+  (the alignment there is too uncertain, or the part of the piece wasn't aligned).
+- **Click** any note, in either roll, to draw a line to its counterpart; the status bar explains
+  what the note is. **Drag a box** to select a group and draw every line at once (hold Shift to
+  add to a selection). Scroll to pan, Ctrl+scroll to zoom, right-drag to pan, Esc to clear.
+
 ## Measured so far
 
 On 52 human performances of 10 pieces (Beethoven, Chopin, Debussy, Liszt, Rachmaninoff,
@@ -103,6 +116,8 @@ wrong notes or more) on dense pieces fall into the "uncertain" band.
 ```
 app.py                  tkinter UI
 midi_cleaner/
+  comparison.py         lays both files on one timeline for the comparison view (no GUI code)
+  compare_view.py       the comparison window: stacked piano rolls and match lines
   loader.py             MIDI -> note table (mido); remembers where every note came from
   alignment.py          coarse + fine time alignment (jump-aware DTW)
   confidence.py         match confidence and verdict
