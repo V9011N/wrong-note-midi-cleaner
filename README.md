@@ -1,5 +1,7 @@
 # wrong-note-midi-cleaner
 
+*NO FURTHER DEVELOPMENT WILL BE MADE, FUNCTIONALITY WILL BE ADDED TO MIDI EDITOR IN HAND-THESIA. THIS IS STAYING UP FOR REFERENCE ONLY*
+
 **Fix the wrong notes in a human piano performance by comparing it against the score it was
 supposed to play.**
 
